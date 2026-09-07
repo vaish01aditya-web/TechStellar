@@ -1,0 +1,256 @@
+// ==========================================================================
+// Legal Metrology Compliance Checker — Prisma Schema
+// ==========================================================================
+// Design principle: the AI/OCR layer only ever writes to ExtractedDeclaration.
+// Compliance verdicts (ComplianceResult / Violation) are written exclusively
+// by the deterministic rule engine (see src/services/ruleEngine.js), never
+// directly by AI output. Every Violation carries its own human-verification
+// state so automated findings stay clearly separate from confirmed ones.
+// ==========================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  ADMIN
+  OFFICER
+  REVIEWER
+}
+
+model User {
+  id        String   @id @default(uuid())
+  email     String   @unique
+  password  String // bcrypt hash, never plaintext
+  fullName  String
+  role      Role     @default(OFFICER)
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  inspections        Inspection[]  @relation("OfficerInspections")
+  reviewedViolations Violation[]   @relation("ReviewerViolations")
+  reports            Report[]
+  auditLogs          AuditLog[]
+}
+
+model Product {
+  id                  String       @id @default(uuid())
+  name                String
+  brand               String?
+  category            String?
+  manufacturerName    String?
+  manufacturerAddress String?
+  createdAt           DateTime     @default(now())
+  updatedAt           DateTime     @updatedAt
+  inspections         Inspection[]
+
+  @@index([category])
+}
+
+enum InspectionStatus {
+  DRAFT
+  PROCESSING
+  ANALYZED
+  UNDER_REVIEW
+  CLOSED
+}
+
+model Inspection {
+  id                String            @id @default(uuid())
+  product            Product?          @relation(fields: [productId], references: [id])
+  productId          String?
+  officer            User              @relation("OfficerInspections", fields: [officerId], references: [id])
+  officerId          String
+  status             InspectionStatus  @default(DRAFT)
+  location           String?
+  notes              String?
+  ruleEngineVersion  String?
+  createdAt          DateTime          @default(now())
+  updatedAt          DateTime          @updatedAt
+
+  images            ProductImage[]
+  declarations      ExtractedDeclaration[]
+  complianceResults ComplianceResult[]
+  reports           Report[]
+  auditLogs         AuditLog[]
+
+  @@index([officerId])
+  @@index([status])
+}
+
+enum ImageType {
+  FRONT
+  BACK
+  LABEL
+  NUTRITION
+  EVIDENCE
+  OTHER
+}
+
+model ProductImage {
+  id           String     @id @default(uuid())
+  inspection   Inspection @relation(fields: [inspectionId], references: [id], onDelete: Cascade)
+  inspectionId String
+  filePath     String // relative path under /uploads
+  originalName String?
+  imageType    ImageType  @default(OTHER)
+  uploadedAt   DateTime   @default(now())
+
+  declarations ExtractedDeclaration[]
+
+  @@index([inspectionId])
+}
+
+enum DeclarationType {
+  MANUFACTURER_NAME_ADDRESS
+  NET_QUANTITY
+  MRP
+  MFG_DATE
+  EXPIRY_DATE
+  BATCH_NUMBER
+  FSSAI_NUMBER
+  CONSUMER_CARE
+  OTHER
+}
+
+model ExtractedDeclaration {
+  id              String          @id @default(uuid())
+  inspection      Inspection      @relation(fields: [inspectionId], references: [id], onDelete: Cascade)
+  inspectionId    String
+  sourceImage     ProductImage?   @relation(fields: [sourceImageId], references: [id])
+  sourceImageId   String?
+  declarationType DeclarationType
+  rawValue        String? // exactly what OCR returned, unmodified
+  normalizedValue String? // post-processed (e.g. date -> ISO)
+  confidence      Float? // 0..1, null = provider gave no score
+  createdAt       DateTime        @default(now())
+
+  violations Violation[]
+
+  @@index([inspectionId])
+  @@index([declarationType])
+}
+
+enum RuleValidationType {
+  PRESENCE
+  FORMAT
+}
+
+enum RuleStatus {
+  ACTIVE
+  DRAFT
+  INACTIVE
+}
+
+model Rule {
+  id                         Int                 @id @default(autoincrement())
+  ruleCode                   String // e.g. RULE-LM-001
+  version                    Int                 @default(1)
+  name                       String
+  description                String?
+  validationType             RuleValidationType
+  applicableDeclarationTypes DeclarationType[]
+  validationConfig           Json                @default("{}")
+  requiresLegalVerification  Boolean             @default(false)
+  status                     RuleStatus          @default(DRAFT)
+  createdAt                  DateTime            @default(now())
+
+  violations Violation[]
+
+  @@unique([ruleCode, version])
+  @@index([status])
+}
+
+enum ComplianceStatus {
+  COMPLIANT
+  NON_COMPLIANT
+  NEEDS_HUMAN_REVIEW
+  ANALYSIS_FAILED
+}
+
+model ComplianceResult {
+  id                String           @id @default(uuid())
+  inspection        Inspection       @relation(fields: [inspectionId], references: [id], onDelete: Cascade)
+  inspectionId      String
+  overallStatus     ComplianceStatus
+  ruleEngineVersion String
+  summary           String?
+  evaluatedAt       DateTime         @default(now())
+
+  violations Violation[]
+
+  @@index([inspectionId])
+}
+
+enum ViolationStatus {
+  FLAGGED
+  CONFIRMED
+  REJECTED
+}
+
+enum HumanVerificationStatus {
+  PENDING
+  VERIFIED_VALID
+  VERIFIED_VIOLATION
+}
+
+model Violation {
+  id                      String                   @id @default(uuid())
+  complianceResult        ComplianceResult         @relation(fields: [complianceResultId], references: [id], onDelete: Cascade)
+  complianceResultId      String
+  rule                    Rule                     @relation(fields: [ruleId], references: [id])
+  ruleId                  Int
+  declaration             ExtractedDeclaration?    @relation(fields: [declarationId], references: [id])
+  declarationId           String?
+  status                  ViolationStatus          @default(FLAGGED)
+  expectedRequirement     String
+  actualObservation       String?
+  reason                  String
+  confidence              Float?
+  humanVerificationStatus HumanVerificationStatus  @default(PENDING)
+  reviewedBy              User?                    @relation("ReviewerViolations", fields: [reviewedById], references: [id])
+  reviewedById            String?
+  reviewedAt              DateTime?
+  reviewNotes             String?
+  createdAt               DateTime                 @default(now())
+
+  @@index([complianceResultId])
+  @@index([status])
+}
+
+enum ReportFormat {
+  PDF
+}
+
+model Report {
+  id            String       @id @default(uuid())
+  inspection    Inspection   @relation(fields: [inspectionId], references: [id], onDelete: Cascade)
+  inspectionId  String
+  format        ReportFormat @default(PDF)
+  filePath      String
+  version       Int          @default(1)
+  generatedBy   User         @relation(fields: [generatedById], references: [id])
+  generatedById String
+  generatedAt   DateTime     @default(now())
+
+  @@index([inspectionId])
+}
+
+model AuditLog {
+  id           Int        @id @default(autoincrement())
+  inspection   Inspection @relation(fields: [inspectionId], references: [id], onDelete: Cascade)
+  inspectionId String
+  actor        User?      @relation(fields: [actorId], references: [id])
+  actorId      String?
+  action       String
+  metadata     Json?
+  createdAt    DateTime   @default(now())
+
+  @@index([inspectionId])
+}
